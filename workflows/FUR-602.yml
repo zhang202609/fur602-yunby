@@ -1,0 +1,154 @@
+name: FUR-602
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      clean:
+        description: 'clean ccache'
+        default: false
+        type: boolean
+
+concurrency:
+  group: fur602-build
+  cancel-in-progress: false
+
+env:
+  REPO_URL: https://github.com/bbb0bbb0bbb/immortalwrt-mt798x-24.10
+  REPO_BRANCH: 2410
+  CONFIG_FILE: ./doc/config/mt7981-honor_fur-602.config
+  EXTRA_CONFIG: ./doc/config/ua2f.config
+  DIY_P1_SH: ./doc/diy/diy-part1.sh
+  DIY_P2_SH: ./doc/diy/diy-part2.sh
+  RELEASE_PREFIX: fur602-immortalwrt-2410
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Prepare environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
+
+    - name: Clone source code
+      working-directory: /workdir
+      run: |
+        df -hT $PWD
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+        # 海外 runner 上国内镜像基本不可达，移除以免拖慢下载
+        PROJECT_MIRRORS_FILE="./scripts/projectsmirrors.json"
+        if [ -f "$PROJECT_MIRRORS_FILE" ]; then
+          sed -i '/.cn\//d; /tencent/d; /aliyun/d' "$PROJECT_MIRRORS_FILE"
+        fi
+
+    - name: Cache
+      uses: klever1988/cachewrtbuild@main
+      with:
+        ccache: 'true'
+        mixkey: 'fur602-mt7981-2410'
+        toolchain: 'true'
+        skip: 'true'
+        clean: ${{ github.event.inputs.clean }}
+        prefix: ${{ github.workspace }}/openwrt
+
+    - name: Load custom feeds
+      run: |
+        [ -e $DIY_P1_SH ] && chmod +x $DIY_P1_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P1_SH
+
+    - name: Update feeds
+      run: cd openwrt && ./scripts/feeds update -a
+
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a
+
+    - name: Load custom configuration
+      run: |
+        [ -e files ] && mv files openwrt/files
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        # 追加可选功能配置（ua2f 等），不需要时把对应行注释掉即可
+        [ -e $EXTRA_CONFIG ] && cat $GITHUB_WORKSPACE/$EXTRA_CONFIG >> openwrt/.config
+        [ -e $DIY_P2_SH ] && chmod +x $DIY_P2_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P2_SH
+
+    - name: Download package
+      id: package
+      run: |
+        cd openwrt
+        make defconfig
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j1 V=s
+        echo "release_tag=${RELEASE_PREFIX}-$(date +%Y.%m.%d)" >> $GITHUB_ENV
+        echo "release_name=${RELEASE_PREFIX}" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
+
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@v4
+      if: steps.compile.outputs.status == 'success' && !cancelled()
+      with:
+        name: ${{ env.release_tag }}
+        path: openwrt/bin
+        overwrite: true
+
+    - name: Organize files
+      id: organize
+      if: steps.compile.outputs.status == 'success' && !cancelled()
+      run: |
+        cd openwrt/bin/targets/mediatek/mt7981
+        if [ -d ../../../packages ]; then
+          tar -cvf packages.tar ../../../packages
+          rm -rf ../../../packages
+        fi
+        rm -rf packages
+        # 注意：保留 sha256sums 与 config.buildinfo，便于校验产物与回溯配置
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware to release
+      uses: softprops/action-gh-release@v2
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: ${{ env.release_name }}
+        tag_name: ${{ env.release_tag }}
+        body: |
+          机型：HONOR FUR-602（honor_fur-602）
+          源码：${{ env.REPO_URL }} @ ${{ env.REPO_BRANCH }}
+          网关：192.168.50.1
+          密码：password（首次登录后请立即修改）
+          已启用：UA2F、mwan3、mtwifi-cfg、zram-swap、BBR
+          说明：已关闭 flow offloading 以保证 UA2F 生效
+        files: ${{ env.FIRMWARE }}/*
+
+    - name: Delete older releases
+      uses: dev-drprasad/delete-older-releases@v0.3.3
+      with:
+        keep_latest: 3
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
